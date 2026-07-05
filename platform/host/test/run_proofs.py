@@ -71,6 +71,13 @@ PROOFS = [
        ["core/mem/operator_new.cpp", "core/mem/mallocator.cpp"] + CONVERT + ["core/io/printf.cpp"]
        + HAL_IO + ["platform/host/heap_host.cpp"],
        ["core/include", "core/convert", "core/mem", "."]),
+    _p("gettext_proof",
+       ["core/io/gettext.cpp"] + HAL_IO,
+       ["core/include", "core/convert", "core/io", "."],
+       stdin=b"abc def\r"),
+    _p("stimer_proof",
+       ["core/util/stimer.cpp", "hal/timer.cpp"] + HAL_IO + ["platform/host/timer_host.cpp"],
+       ["core/include", "core/convert", "core/util", "core/io", "."]),
     _p("elf_proof",
        ELF + ["core/util/misc_token.cpp"] + CONVERT + ["core/io/printf.cpp"] + HAL_IO,
        ["core/include", "core/convert", "core/io", "core/util", "core/elf", "."]),
