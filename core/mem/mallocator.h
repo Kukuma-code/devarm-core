@@ -86,8 +86,16 @@ private:
 	unsigned int share;             /* 使用中バイト数 (ヘッダ込み) */
 
 public:
-	mallocator_(){ init(); }
+	/* 遅延初期化対応: ELF (Linux) では core/mem/malloc.cpp の malloc が process
+	   全体へ interpose され、共有ライブラリの初期化 (libstdc++ の EH pool 等) から
+	   本コンストラクタより先に呼ばれうる。その場合 malloc 側が ensure_init() で
+	   初期化済みなので、ここで init() し直すと先行確保を孤児化する。静的記憶域は
+	   動的初期化前にゼロ初期化されるため current==0 が「未初期化」を表す。 */
+	mallocator_(){ ensure_init(); }
 	~mallocator_(){}
+
+	bool ready() const { return current != 0; }
+	void ensure_init(){ if ( !ready() ) init(); }
 
 	void init(){
 		state = MALLOCATOR::CLEAN; size = 0; share = 0;
