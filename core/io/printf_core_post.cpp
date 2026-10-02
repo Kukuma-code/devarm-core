@@ -1,7 +1,15 @@
+	/* table[TABLE_DIGIT] の境界: リテラル/%s は 1 文字ずつ残量を確認し、変換は
+	   開始前に最大出力長 (CONV_RESERVE) の空きを確認する。足りなければ以降を
+	   切り捨てる (従来は無検査でスタック上の table を越えて書いていた)。
+	   変換 1 個の最大出力: %lv = 0b + 64 桁 + 16 区切り = 82 < CONV_RESERVE。 */
+#define CONV_RESERVE 0x60
 	while( (get_next(ch)) != 0 ){
+		if ( cnt >= TABLE_DIGIT - 1 ) break;
 		if ( ch == 0x5c ) { // 0x5c is escape.
-			get_next(ch); table[cnt++]=(char)ch; continue; }
+			get_next(ch); if ( !ch ) break;   /* 末尾の '\\' で終端を読み越さない */
+			table[cnt++]=(char)ch; continue; }
 		if ( ch != '%' ) { table[cnt++]=(char)ch; continue; }
+		if ( cnt + CONV_RESERVE >= TABLE_DIGIT ) break;
 
 		get_next(ch); // % format bellow
 		width=status=0; small_digit=6; pad=' ';
@@ -21,12 +29,16 @@
 				if ( small_digit > SUBTABLE_DIGIT ) small_digit=SUBTABLE_DIGIT;
 				get_next(ch);	}
 		}
-		if ( ch == 'l' ) { status|=ISLONG; get_next(ch); }
+		/* 'l' は原典の規約で 64bit (long long) を意味する (旧 test/conv は %ld に
+		   long long を渡す)。標準の 'll' も同義として受理する。 */
+		if ( ch == 'l' ) { status|=ISLONG; get_next(ch); if ( ch == 'l' ) get_next(ch); }
 		if ( !ch ) break;
 		i=0;
 		switch(ch){
 		case 's':
-			tmp= va_arg(argp,char*); while ( *tmp != 0 ) table[cnt++]=*tmp++; continue;
+			tmp= va_arg(argp,char*);
+			while ( *tmp != 0 && cnt < TABLE_DIGIT - 1 ) table[cnt++]=*tmp++;
+			continue;
 		case 'c':
 			table[cnt++]=(char)va_arg(argp,int); continue;
 		case 'u' : 
@@ -34,7 +46,9 @@
 				val2=va_arg(argp,unsigned long long);
 			if (val2== 0) { subtable[i++]='0';break; }
 			} else {
-				val2=va_arg(argp,unsigned long);
+				/* 非 l の %u は unsigned int で受ける (LP64 で unsigned long として読むと
+				   上位 32bit が不定値になる。ILP32 では同幅で挙動不変)。 */
+				val2=va_arg(argp,unsigned int);
 			if (val2== 0) { subtable[i++]='0';break; }
 			}
 			do {
@@ -70,14 +84,30 @@
 				if ( status & ISCARRY) subtable[i-1]+=1;
 			}
 			break;
-		case 'p':
+		case 'p': {
+			/* ポインタは pointer 幅で受ける (int で読むと LP64 で下位 32bit に切れる)。
+			   既定幅は sizeof(void*)*2 桁 = ILP32 では従来どおり 8 桁。 */
+			table[cnt++]='0';table[cnt++]='x';
+			long pw = width ? width : (long)(sizeof(void*) * 2);
+			ulntoah((unsigned long long)(uintptr_t)va_arg(argp,void*),&table[cnt],(int)pw);
+			cnt += (pw * 4 > DOUBLE_DIGIT) ? DOUBLE_DIGIT / 4 : pw;
+			break; }
 		case 'X' :
 			table[cnt++]='0';table[cnt++]='x';
+			[[fallthrough]];   /* 接頭辞 0x を付けて 'x' と同じ変換へ */
 		case 'x' :
+		{
+			/* 桁数 = width (0 なら最大桁)。最大桁 (8 / l で 16) を超える width は
+			   従来 cnt だけ進めて table に NUL を残し出力が切れていた。超過分は
+			   pad 文字 (右詰め '-' 指定時は空白を後置) で埋める。 */
+			long hd = ( status & ISLONG ) ? 0x10 : 0x08;
+			long dg = ( width == 0 || width > hd ) ? hd : width;
+			long extra = ( width > hd ) ? width - hd : 0;
+			if ( !(status & ISRIGHT) ) for ( ; extra>0; --extra ) table[cnt++]=(char)pad;
 			if (status & ISLONG ) {
 				val2=va_arg(argp,unsigned long long);
-				lntoah(val2,&table[cnt],width);
-				if (width == 0) cnt+=0x10; else cnt+=width;
+				ulntoah(val2,&table[cnt],(int)dg);
+				cnt+=dg;
 
 // 				if ( (ch=( width *4 )) > DOUBLE_DIGIT || width == 0) ch =DOUBLE_DIGIT;
 // 				for (j=ch-4; j>=0 ; j=j-4){
@@ -89,8 +119,8 @@
 			}
 			else{
 				get_value(int);
- 				ntoah(val,&table[cnt],width);
- 				if (width == 0) cnt+=0x08; else cnt+=width;
+ 				ntoah((int)val,&table[cnt],(int)dg);
+ 				cnt+=dg;
 
 // 				if ( (ch=( width *4 )) > LONG_DIGIT || width == 0) ch =LONG_DIGIT;
 // 				for (j=ch-4; j>=0 ; j=j-4){
@@ -100,9 +130,12 @@
 // 					table[cnt++]=n;
 // 				}
 			}
+			for ( ; extra>0; --extra ) table[cnt++]=' ';   /* 右詰め時の後置 */
 			break;
+		}
 		case 'B':
 			table[cnt++]='0';table[cnt++]='b';
+			[[fallthrough]];   /* 接頭辞 0b を付けて 'b' と同じ変換へ */
 		case 'b' :
 			if ( status & ISLONG ){
 				get_value(long long);
@@ -119,6 +152,7 @@
 			break;
 		case 'V' :
 			table[cnt++]='0';table[cnt++]='b';
+			[[fallthrough]];   /* 接頭辞 0b を付けて 'v' と同じ変換へ */
 		case 'v' :
 			if ( status & ISLONG ){
 				get_value(long long);
@@ -138,7 +172,9 @@
 		case 'w':
 			status|=ISFLOAT;
 			vald=va_arg(argp, double);
-			dtoa(vald, subtable);
+			/* 精度 small_digit (既定 6, %.0f 可) で正しく丸めた文字列を得る。
+			   精度上限は dtoa_prec が DTOA_PREC_MAX へ丸め、出力は subtable に収まる。 */
+			dtoa_prec(vald, subtable, (int)small_digit);
 			break;
 		case 'o':
 			val2=va_arg(argp,unsigned long);
@@ -153,21 +189,18 @@
 		// post process
 #define pad_width val
 		if ( status & ISFLOAT ){
-			while ( subtable[i] != 0 && subtable[i] != '.' ) table[cnt++]=subtable[i++];
-			table[cnt++]=subtable[i++];
-			//			DBGDN(small_digit);
-			val=0;
-			if ( subtable[i+small_digit]+5 > (0x30+10) ){
-				DBGDN(subtable[i+small_digit]);
-				val=1;
-				for ( j=small_digit; j>=0; j--){
-					subtable[i+j]+=val;
-					//					DBGDN2(j,subtable[i+j]);
-					if ( subtable[i+j] >= ( 0x30+10) ) {subtable[i+j]-=0x30; val=1;}
-					else break;
-				}
+			/* subtable は dtoa_prec が丸め済みの完成文字列。ここでは field width だけ
+			   適用する (従来はここで再丸めし、切り捨て桁へ加算する誤りと '9' 繰上げで
+			   制御文字を出す誤りがあった)。 */
+			for ( j=0; subtable[j] != 0; ++j ) ;
+			pad_width = ( width > j ) ? width - j : 0;
+			i=0;
+			if ( !(status & ISRIGHT) ){
+				if ( pad == '0' && subtable[0] == '-' ) table[cnt++]=subtable[i++];
+				for ( ; pad_width>0; --pad_width ) table[cnt++]=(char)pad;
 			}
-			while ( small_digit-- > 0 ) table[cnt++]=subtable[i++];
+			while ( subtable[i] != 0 ) table[cnt++]=subtable[i++];
+			for ( ; pad_width>0; --pad_width ) table[cnt++]=' ';
 		} else {
 			if ( subtable[0] ){
 				//				i--;
@@ -207,3 +240,4 @@
 #undef ISLONG
 #undef ISFLOAT
 #undef pad_width
+#undef CONV_RESERVE

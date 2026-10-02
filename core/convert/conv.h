@@ -30,6 +30,7 @@ nINLINE	int lntoadv(long long val, char* result, int _width=0, int _pad=0x20);
 	//	int lntoadf(long long val, char* result, int _width=0, int _pad=0x20);
 nINLINE	int lntoa(long long val, char* result, int radix=0x0a);
 nINLINE	int dtoa(double ref, char* buf,int _width=6, int _pad=0x20);
+nINLINE	int dtoa_prec(double ref, char* buf, int prec);   /* prec 0 可 (小数点なし) */
 // 	int dtoa(double ref, char* buf,int _width=6, int _small_width=3, int _pad=0x20);
 nINLINE	int aton(char *str, int *ret, char sep= 0x20);
 #else
@@ -37,6 +38,7 @@ nINLINE	int ntoa(int val, char* result, int radix);
 	//	int lntoa(int val, char* result, int radix);
 nINLINE	int lntoa(long long val, char* result, int radix);
 nINLINE	int dtoa(double ref, char* buf);
+nINLINE	int dtoa_prec(double ref, char* buf, int prec);
 nINLINE	int aton(char *str, int *ret);
 #endif
 #ifdef __cplusplus

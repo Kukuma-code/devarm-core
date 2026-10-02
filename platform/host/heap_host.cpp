@@ -18,5 +18,9 @@
    alignof=1 のため、max_align_t 境界へ明示的に整列する (>=8 を常に満たす)。 */
 alignas(std::max_align_t) static unsigned char host_heap[HOST_HEAP_SIZE];
 
-extern "C" unsigned char* heap_begin = host_heap;
-extern "C" unsigned char* heap_end   = host_heap + HOST_HEAP_SIZE;
+/* `extern "C" T x = init;` は GCC が -Wextra で「extern 宣言の初期化」と警告するため、
+   linkage ブロック形式で定義する (C linkage の定義である点は同じ)。 */
+extern "C" {
+unsigned char* heap_begin = host_heap;
+unsigned char* heap_end   = host_heap + HOST_HEAP_SIZE;
+}

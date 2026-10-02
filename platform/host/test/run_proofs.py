@@ -67,6 +67,9 @@ PROOFS = [
        ["core/mem/malloc.cpp", "core/mem/mallocator.cpp"] + CONVERT + ["core/io/printf.cpp"]
        + HAL_IO + ["platform/host/heap_host.cpp"],
        ["core/include", "core/convert", "core/mem", "core/block", "."]),
+    _p("mallocator_lazy_proof",
+       CONVERT + ["core/io/printf.cpp"] + HAL_IO + ["platform/host/heap_host.cpp"],
+       ["core/include", "core/convert", "core/mem", "."]),
     _p("opnew_proof",
        ["core/mem/operator_new.cpp", "core/mem/mallocator.cpp"] + CONVERT + ["core/io/printf.cpp"]
        + HAL_IO + ["platform/host/heap_host.cpp"],
@@ -105,7 +108,11 @@ def run(proof: dict, outdir: str) -> tuple[bool, str]:
     out = r.stdout.decode("utf-8", "replace") + r.stderr.decode("utf-8", "replace")
     failed = ("[FAIL]" in out) or ("SOME FAILED" in out)
     ok = (r.returncode == 0) and not failed
-    return ok, out.strip()
+    out = out.strip()
+    if r.returncode != 0:   # 出力なしのクラッシュでも理由が見えるよう終了状態を付記
+        st = f"signal {-r.returncode}" if r.returncode < 0 else f"exit {r.returncode}"
+        out = (out + "\n" if out else "") + f"({st})"
+    return ok, out
 
 
 def evaluate(proof: dict, outdir: str, verbose: bool) -> dict:

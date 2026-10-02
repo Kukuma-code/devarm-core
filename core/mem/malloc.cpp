@@ -8,8 +8,9 @@
  *
  * 原典からの変更:
  *   - FUNC_ALIAS(inline asm) 廃止 → 直接 mallocator.alloc/dealloc を呼ぶ。
- *   - malloc は C 意味論に合わせ、確保失敗（mallocator.alloc の std::bad_alloc）を
- *     捕捉して NULL を返す（operator new は送出、C malloc は NULL が正）。
+ *   - malloc は C 意味論に合わせ、確保失敗時に NULL を返す（operator new は送出、
+ *     C malloc は NULL が正）。送出→捕捉ではなく非送出の mallocator.try_alloc を使う:
+ *     例外オブジェクトの確保自体が malloc へ再入し無限再帰するため（mallocator.h 参照）。
  *   - realloc は旧ノードの payload サイズ（MNODE::size, alloc 時に MALLOCATOR_ALIGN へ
  *     丸め済み）を読み、min(old,new) を byte_copy でコピー。
  *
@@ -19,21 +20,14 @@
  * host 注意: これらはグローバル C シンボル。(malloc は macOS SDK が noexcept なしで宣言するため noexcept は付けない; 実際は内部捕捉で非送出。)
  *   macOS の二段階名前空間では libSystem 内部の
  *   malloc 使用とは分離されるが、フラット名前空間や firmware では process 全体を担う。
- *   Linux (ELF) では libstdc++ 等の共有ライブラリ初期化から mallocator の動的初期化
- *   より前に malloc が呼ばれるため、malloc 入口で ensure_init() により遅延初期化する
- *   (未初期化のまま enlarge が bad_alloc を投げ、__cxa_allocate_exception -> malloc
- *   と無限再帰していた)。
  *********************************************/
 #include <cstddef>       /* size_t */
-#include <new>           /* std::bad_alloc */
 #include "mallocator.h"  /* mallocator / MNODE / size_ / uintptr_t */
 #include "byte.h"        /* byte_copy (src, dst, cnt) */
 
 extern "C" void* malloc(size_t size) {
 	if ( size == 0 ) return 0;
-	mallocator.ensure_init();   /* 動的初期化前の呼出し (ELF interpose) に備えた遅延初期化 */
-	try { return (void*)mallocator.alloc((size_)size); }
-	catch (const std::bad_alloc&) { return 0; }
+	return (void*)mallocator.try_alloc((size_)size);   /* 非送出 (理由は try_alloc 参照) */
 }
 
 extern "C" void free(void* ptr) {

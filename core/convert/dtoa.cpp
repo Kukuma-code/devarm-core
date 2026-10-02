@@ -1,222 +1,129 @@
 /*********************************************
- * dtoa: double -> ASCII 文字列変換
+ * dtoa: double -> ASCII 文字列変換 (固定小数点表記)
  *
- * FIXED (著者 TODO の「dtoa に bug」を解消。原因は2つ):
- *   1. IEEE754 ビット取得時の 32bit ワードスワップ。X86->ARM 移植時に旧 ARM
- *      (FPA/OABI) のワード順対策として混入したが、標準 IEEE (ホスト/EABI
- *      little-endian) では不要で、符号・指数の抽出を破壊していた。
- *      -> 標準レイアウトを memcpy で直接読むよう修正。
- *   2. 出力 buf の null 終端漏れ。printf 経由 (ゼロ初期化バッファ) では露見
- *      しないが putd の未初期化バッファ渡しで末尾ゴミが出ていた。
- *      -> 末尾に buf[j]=0 を追加。
- *   検証: putd / printf("%f") ともシステム printf と一致
- *         (platform/host/test/io_proof.cpp)。
+ * 経緯:
+ *   旧実装 (原典の移植) は 2 度修正した (ワードスワップ除去・null 終端)。
+ *   Linux/x86-64 検証 (2026-10) で、なお次の誤りが残っていた:
+ *     - 丸めが切り捨て桁へ加算しており、保持桁は繰り上がらない
+ *       (%.1f 9.96 -> 9.9、%.2f 0.999 -> 0.99)。小数部から整数部への繰上げなし。
+ *     - 2^-19 未満の値で隠れビット項 10^n/2^n が 64bit を桁あふれ (1e-10 が誤値)。
+ *     - 2^52 以上で 64 以上のシフト量 (未定義動作)、2^52 付近で ':' を出力。
+ *     - 0 / 非正規数 / inf / nan で pow(2,1023) の long long 変換 (未定義動作)。
+ *   局所修正では塞がらないため、アルゴリズムを置き換えた:
+ *
+ * 方式 (正確変換):
+ *   v = m * 2^e (m: 53bit 仮数) と分解する。整数部は m を e だけシフトした
+ *   64bit 整数、小数部は分子 frac / 分母 2^k (k=-e, 最大 1074) を uint32 limb
+ *   の多倍長で持ち、10 倍して k ビット目以上を取り出すことで 10 進桁を正確に
+ *   得る。丸めは正確値に対する最近接偶数丸め (glibc の printf と同じ結果)。
+ *   32bit ARM でも uint32 x 10 + 繰上げ (64bit 中間値) だけで動く。
  *
  * 仕様/制限:
- *   _width = 小数点以下の桁数(精度, 既定 6)。フィールド幅パディングと右詰め
- *   (_pad) は未実装。旧版の 2 引数 dtoa (raw_dtoa.c) は未使用のため core から除外。
+ *   dtoa(ref, buf, _width): _width = 小数桁 (精度)。0 は既定 6 (従来互換)、負は絶対値。
+ *   dtoa_prec(ref, buf, prec): prec=0 を許す (小数点なし, %.0f 用)。
+ *   精度は DTOA_PREC_MAX (40) で頭打ち。出力最大長 = 符号 1 + 整数 20 + '.' + 40 + NUL
+ *   = 63 バイト (printf の subtable 64 / putd の 0x44 に収まる)。
+ *   |v| >= 2^64 は整数部が 64bit に収まらないため "ovf" (符号付き) を書き 0 を返す。
+ *   inf / nan は "inf" / "nan" (負なら '-' 前置, glibc と同表記)。
+ *   フィールド幅パディング (_pad) は未実装 (printf 側が幅を適用する)。
  *********************************************/
-// #undef DEBUG
-// #ifdef DBG_FPRINTD
-// #define DEBUG
-// #endif
-
-#ifdef DBG_DTOA_ENABLE
-#define DBG_PTAB() print_array(table, TABLE_DIGIT)
-#define DBG_PTAB_SUB() print_array(subtable, REAL_DIGIT)
-#define DBG_BITD(x) print_bitd(x)
-#else
-#define DBG_PTAB()
-#define DBG_PTAB_SUB()
-#define DBG_BITD(x)
-#endif
 #include "core_config.h"
-#include "math.h"
 #include "conv.h"
-#undef TABLE_DIGIT
-#define TABLE_DIGIT 0x50
-#define REAL_DIGIT 0x34
-#define SUPER_DIGIT 0x0b
-#define SIGN_DIGIT 0x01
-#define ISSIGN 0x01
-#define ISRIGHT 0x02
-#define ISESIGN 0x04
-// |S| -- SUPER_DIGIT -- | -- REAL_DIGIT -- |
-int dtoa(double ref, char* buf, int _width, int _pad){
-	FUNC_IN();
-	long i, j;
-	unsigned long long tmpbit;
-	unsigned long long b=0;
-	unsigned long long c, bias=0;
-	//	unsigned long long b;
-	unsigned long long radix=10;
-	char table[TABLE_DIGIT];
-	char subtable[TABLE_DIGIT];
-	int sign, e_sign=0;
-	long long super;
-	long long pow_sp, pow_rl;
-	unsigned long long int_p=0 , small;
-	// _width は小数桁(精度)。フィールド幅パディング(_pad/右詰め)は未実装のため
-	// _pad は現状未使用。負の _width は精度の絶対値として扱う。
-	(void)_pad;
-	if ( _width < 0 ) _width = -_width;
-	for ( i=0; i<TABLE_DIGIT; i++) {
-		table[i]=0;	
-		subtable[i]=0;
-	}
-	// IEEE754 double のビットパターンを取得する。
-	// 旧コードは上下 32bit ワードを入れ替えていた (X86->ARM 移植時に、旧 ARM の
-	// FPA/OABI では double のワード順が逆になる対策として混入)。しかし標準 IEEE754
-	// (ホスト、および ARM EABI little-endian) ではスワップ不要で、これが putd 破損の
-	// 原因だった。ここでは標準レイアウトを直接読む (strict-aliasing 安全に memcpy)。
-	__builtin_memcpy(&tmpbit, &ref, sizeof(tmpbit));
-	DBG_DTOA("value : ");DBG_BITD(tmpbit);
-	sign=(int) ( tmpbit >> ( DOUBLE_DIGIT - 1 ) ) ;
-	DBG_DTOA_D(DBGDN(sign));
-	SLIGHTIN();
-	small = tmpbit << 1;
-	//	DBG("bit << 1 : ");DBG_BITD(small);
-	super = ( small >> ( REAL_DIGIT + 1 ) ) ;
-	DBG("super bit : ");DBG_BITD(super);
-	DBGLD(super);DA();DBGLD((long long)pow(2,SUPER_DIGIT-1)-1);DN();
-	super = super - ( (long long)pow(2, SUPER_DIGIT - 1 )  - 1)  ;
-	DBG("[Ajust] super = super - ( pow(2,0xb-1) -1)\n");DBGLD(super);DA();DBG_BITD(super);
-	if ( super < 0 ) { e_sign=1; super=-super; }
-	pow_sp=(long long)pow(2,super);
-	DBGD(e_sign) ;DN();
-	DBG("[Identify Small part] : "); 
-	if ( e_sign ) {
-		DBG("***** Small part only. *****");DN();
-		small= tmpbit << ( DOUBLE_DIGIT - REAL_DIGIT );
-		small= small >> ( DOUBLE_DIGIT - REAL_DIGIT ) ;
-	}
-	else {
-		DBG("***** Integer part has. *****");DN();
-		small= tmpbit << ( ( DOUBLE_DIGIT - REAL_DIGIT + super ) );
-		small= small >> ( DOUBLE_DIGIT - REAL_DIGIT + super );
-		if ( super ){
-			int_p = tmpbit << ( DOUBLE_DIGIT - REAL_DIGIT );
-			int_p = int_p >> ( ( DOUBLE_DIGIT - REAL_DIGIT ) + ( REAL_DIGIT - super ));
-		}
-		DBG_DTOA("int part   :");DBG_BITD(int_p);
-	}
-	DBG_DTOA("small part :");DBG_BITD(small);
-	DBG("[Preparation]<END>"); DN();
-	SLIGHTIN();
-	DBG("[Small part process 1]<IN>");DBGN();
-	if ( small != 0 ){
-		DBG_DTOA("[Small part has]<IN>\n");
-		if ( !e_sign ) b=small << super;
-		else { b=small ;}
-		i=0;c=1;
-		pow_rl=(long long)pow(2,REAL_DIGIT);
-		while ( c != 0 ){
-			b= b*radix;
-			c= b % pow_rl;
-			b= b / pow_rl;
-			table[i]=b;
-			b=c ;
-			i++;
-		}
-		DBG_DTOA("          : 0.");DBG_PTAB();
-		DBG("[Small part process 1]<OUT>");DBGN();
-		if ( e_sign ){
-#define mod bias
-		DBG("[Small part process 2]<IN>");DBGN();
-		DBG("small part divided by pow_sp=(long long)pow(2,super)::");DBGLD(pow_sp);DBGN();
-		i=0;
-		while ( table[i] == 0 ) i++;
-		//		printf("i : %d\n", i);
-		while ( i < TABLE_DIGIT ){	c= (mod*radix) + table[i];
-			b = c / pow_sp; mod = c % pow_sp;	table[i]=b;
-			//		printf("%d : %d , next mod : %d\n", i, table[i], mod);
-			i++; }
-		//		putchar('\n');
-		DBG_DTOA("small part table: 0.");DBG_PTAB();
-		DBG("[Small part process 2]<OUT>");DBGN();
-		}
-	}
-	if ( e_sign ){
-		SLIGHTIN();
-		DBG("[Small part process3]<IN>");DBGN();
-		DBG("1 divided by 2 at 'super number' times.: %d\n", super);
-		c=super;b=1;
-		while ( c != 0 ){	b= b*radix;	b= b / 2;	c--; }
-		DBG("trans value : %ld , ",b);
-		c= pow_sp; bias=-1;
-		while ( c != 0 ){	c=c/radix; ++bias; }
-		DBG("small digit bias : %ld \n", bias);
-		c=b; super=0;
-		while ( c != 0 ){ subtable[super]=c%radix; c=c/radix;	++super; }
-		DBG("pow_sp : %d , bias : %d\n", pow_sp, bias);
-		DBG("b : %d , ref_digit : %d\n", b, super);
-		
-		DBG_PTAB_SUB();
-		DBG("[Small part process]<OUT>");DBGN();
-		DBG("[Sum process2 and process3]<IN>");DN();
-		b=0;
-		for ( j=super-1, i=0 ; i<super ; i++, j--){
-			////		DBG("i :%d , table : %d, sub : %d\n", i, table[bias+j], subtable[i]);
-			table[bias+j]+=b+subtable[i];
-			if ( table[bias+j] >= 10 ) {
-				table[bias+j]-=10; b=1; }
-			else b=0;
-		}
-		if ( b ) table[bias+j]+=b;
-		DBG_PTAB();
-		DBG("[Sum process2 and process3]<OUT>");DN();
-	} //e_sign
 
-	SLIGHTIN();
-	DBG_PTAB();
-	DBG("[Last process]");DBGN();
-	j=0;
-	//	//	printf("%f\n", ref);
+#define DTOA_PREC_MAX 40
+#define FRAC_LIMBS 36   /* 分母 2^1074 の分子 + 10 倍の桁上がり分 (uint32 x 36 = 1152bit) */
+
+static void dtoa_put_u64(unsigned long long v, char* buf, long& j){
+	char t[20]; int n=0;
+	do { t[n++]=(char)('0' + v % 10); v /= 10; } while ( v != 0 );
+	while ( n > 0 ) buf[j++]=t[--n];
+}
+
+static void dtoa_put_str(const char* s, char* buf, long& j){
+	while ( *s ) buf[j++]=*s++;
+}
+
+int dtoa_prec(double ref, char* buf, int prec){
+	unsigned long long bits;
+	__builtin_memcpy(&bits, &ref, sizeof(bits));   /* IEEE754 binary64 を直接読む */
+	int sign = (int)(bits >> 63);
+	int ex   = (int)((bits >> 52) & 0x7ff);
+	unsigned long long m = bits & ((1ull << 52) - 1);
+	long j=0;
+	if ( prec < 0 ) prec = -prec;
+	if ( prec > DTOA_PREC_MAX ) prec = DTOA_PREC_MAX;
 	if ( sign ) buf[j++]='-';
-	if ( !e_sign ) {
-		DBG_DTOA("[Int part calc]<IN>");DN();
-		DBGLD(int_p);DA();DBGLD(pow_sp);DN();
-#ifdef __cplusplus
-		if ( !lntoa(int_p+pow_sp, &buf[j])) return NUL_(PRINTD_LNTOA);
-#else
-		if ( !lntoa(int_p+pow_sp, &buf[j], 0x0a )) return NUL_(PRINTD_LNTOA);
-#endif
-		while ( buf[j] != 0 ) j++;
-		buf[j++]='.';
-		DBGS(buf);DBGN();
-		DBG_DTOA("[Int part calc]<OUT>");DN();
-	} else { buf[j++]='0'; buf[j++]='.'; }
-	//	simple round.
-
-	if ( _width == 0 ) _width=6;
-	if ( table[_width]+5 > 10 ){
-		b=1;
-		for ( i=_width; i>=0; i--){
-			table[i]+=b;
-			if ( table[i] >= 10 ) {table[i]=0; b=1;}
-			else break;
-		}
+	if ( ex == 0x7ff ) {
+		dtoa_put_str(m ? "nan" : "inf", buf, j); buf[j]=0;
+		return TRUE;
 	}
-	for ( i=0; i<_width; i++ ) buf[j++]=table[i]+0x30;
-	buf[j]=0;   // null 終端 (未初期化バッファ渡しでの末尾ゴミ出力を防ぐ)
-// 	if ( table[6]+5 > 10 ){
-// 		b=1;
-// 		for ( i=6; i>=0; i--){
-// 			table[i]+=b;
-// 			if ( table[i] >= 10 ) {table[i]=0; b=1;}
-// 			else break;
-// 		}
-// 	}
-// 	for ( i=0; i<6; i++ ) buf[j++]=table[i]+0x30;
+	int e;
+	if ( ex == 0 ) e = -1074;                     /* 0 / 非正規数 */
+	else { m |= 1ull << 52; e = ex - 1075; }      /* 正規数: 隠れビットを付与 */
 
-	//	printf("%s\n", buf );DBGN();
-	/*
-	for ( i=0 ; i<7 ; i++) printf("%d", table[i]);
-	*/
-	FUNC_OUT();
+	unsigned long long ip;                        /* 整数部 */
+	unsigned int frac[FRAC_LIMBS];                /* 小数部の分子 (分母 2^k) */
+	for ( int i=0; i<FRAC_LIMBS; ++i ) frac[i]=0;
+	int k=0;
+	if ( e >= 0 ) {
+		if ( e > 11 ) {                           /* m < 2^53 なので e<=11 で < 2^64 */
+			dtoa_put_str("ovf", buf, j); buf[j]=0;
+			return NUL_(DTOA_RANGE_OVER);
+		}
+		ip = m << e;
+	} else {
+		k = -e;
+		ip = ( k < 64 ) ? ( m >> k ) : 0;
+		unsigned long long f = ( k < 64 ) ? ( m & ((1ull << k) - 1) ) : m;
+		frac[0]=(unsigned int)f; frac[1]=(unsigned int)(f >> 32);
+	}
+
+	/* 小数 prec 桁 + 丸め判定用の次の 1 桁を生成。rest は以降に非零が残るか。 */
+	char dg[DTOA_PREC_MAX];
+	int nxt=0, rest=0;
+	if ( k ) {
+		int w = k / 32, b = k % 32;               /* k ビット目 = limb w の bit b */
+		for ( int d=0; d<=prec; ++d ) {
+			unsigned long long c=0;
+			for ( int i=0; i<=w+1; ++i ) {
+				c += (unsigned long long)frac[i] * 10u;
+				frac[i]=(unsigned int)c; c >>= 32;
+			}
+			unsigned int digit;
+			if ( b == 0 ) { digit = frac[w]; frac[w]=0; }
+			else {
+				digit = (frac[w] >> b) | (frac[w+1] << (32 - b));
+				frac[w] &= (1u << b) - 1u; frac[w+1]=0;
+			}
+			if ( d < prec ) dg[d]=(char)digit; else nxt=(int)digit;
+		}
+		for ( int i=0; i<FRAC_LIMBS; ++i ) if ( frac[i] ) { rest=1; break; }
+	} else {
+		for ( int d=0; d<prec; ++d ) dg[d]=0;
+	}
+
+	/* 最近接偶数丸め */
+	int last = prec ? dg[prec-1] : (int)(ip & 1);
+	if ( nxt > 5 || ( nxt == 5 && ( rest || (last & 1) ) ) ) {
+		int i=prec-1;
+		for ( ; i>=0; --i ) { if ( ++dg[i] < 10 ) break; dg[i]=0; }
+		if ( i < 0 ) ++ip;                        /* 小数部から整数部へ繰上げ (e<0 なので ip < 2^53) */
+	}
+
+	dtoa_put_u64(ip, buf, j);
+	if ( prec ) {
+		buf[j++]='.';
+		for ( int d=0; d<prec; ++d ) buf[j++]=(char)('0' + dg[d]);
+	}
+	buf[j]=0;
 	return TRUE;
 }
-#undef TABLE_DIGIT
-#undef REAL_DIGIT
-#undef SUPER_DIGIT
-#undef SIGN_DIGIT
+
+int dtoa(double ref, char* buf, int _width, int _pad){
+	(void)_pad;   /* フィールド幅パディングは未実装 (ファイル冒頭参照) */
+	if ( _width < 0 ) _width = -_width;
+	if ( _width == 0 ) _width = 6;
+	return dtoa_prec(ref, buf, _width);
+}
+#undef DTOA_PREC_MAX
+#undef FRAC_LIMBS

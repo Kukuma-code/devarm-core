@@ -17,6 +17,14 @@
 #include "mallocator.h"
 #include "hal/heap.h"
 
+/* clang は -O1 以上で malloc/realloc を組込み関数として扱い、「malloc(0)==NULL」等の
+   比較を定数畳み込みする (標準 malloc の意味論を仮定)。core の実装そのものを
+   検証するため、volatile 関数ポインタ経由で呼んで畳み込みを止める。 */
+static void* (*volatile p_malloc)(size_t) = malloc;
+static void* (*volatile p_realloc)(void*, size_t) = realloc;
+#define malloc(n) p_malloc(n)
+#define realloc(p, n) p_realloc(p, n)
+
 static int failed = 0;
 static bool in_heap(void* p){ return (unsigned char*)p >= heap_begin && (unsigned char*)p < heap_end; }
 static void check(const char* name, bool ok){

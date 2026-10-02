@@ -1,4 +1,5 @@
 #include <stdarg.h>
+#include <stdint.h>   /* uintptr_t (printf_core の %p) */
 #include "core_config.h"
 #include "aout.h"
 #include "conv.h"
@@ -11,8 +12,9 @@ extern "C" {
 #include "printf_core.cpp"
 		i=0;
 		while (table[i] != 0 ) *str++=table[i++];
-	if ( err > 0 ) return err;
-	return TRUE;
+		*str=0;   /* 終端 NUL (C 標準。欠くと呼出側バッファが未終端のまま残る) */
+	if ( err > 0 ) return (int)err;
+	return (int)cnt;   /* 書いた文字数 (終端 NUL を除く。従来は TRUE 固定) */
 }
 /*
 #ifdef __cplusplus

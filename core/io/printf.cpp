@@ -1,4 +1,5 @@
 #include <stdarg.h>
+#include <stdint.h>   /* uintptr_t (printf_core の %p) */
 #include "core_config.h"
 #include "aout.h"
 #include "conv.h"
@@ -14,8 +15,8 @@ extern "C" {
 int printf(const char* format, ...){
 #include "printf_core.cpp"
 	puts(table);
-	if ( err > 0 ) return err;
-	return TRUE;
+	if ( err > 0 ) return (int)err;
+	return (int)cnt;   /* 出力文字数 (C 標準。従来は TRUE 固定) */
 }
 
 /*

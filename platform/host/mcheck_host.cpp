@@ -11,6 +11,8 @@
 static int host_can_read(const void*){ return 1; }
 static int host_can_write(const void*){ return 1; }
 
-/* 継ぎ目にホスト実装を差し込む */
-extern "C" int (*mem_can_read)(const void*)  = host_can_read;
-extern "C" int (*mem_can_write)(const void*) = host_can_write;
+/* 継ぎ目にホスト実装を差し込む (linkage ブロック形式: heap_host.cpp と同じ理由) */
+extern "C" {
+int (*mem_can_read)(const void*)  = host_can_read;
+int (*mem_can_write)(const void*) = host_can_write;
+}

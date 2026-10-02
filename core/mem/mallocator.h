@@ -88,9 +88,11 @@ private:
 public:
 	/* 遅延初期化対応: ELF (Linux) では core/mem/malloc.cpp の malloc が process
 	   全体へ interpose され、共有ライブラリの初期化 (libstdc++ の EH pool 等) から
-	   本コンストラクタより先に呼ばれうる。その場合 malloc 側が ensure_init() で
-	   初期化済みなので、ここで init() し直すと先行確保を孤児化する。静的記憶域は
-	   動的初期化前にゼロ初期化されるため current==0 が「未初期化」を表す。 */
+	   本コンストラクタより先に呼ばれうる。その場合は try_alloc 入口の ensure_init()
+	   で初期化済みなので、ここで init() し直すと先行確保を孤児化する。静的記憶域は
+	   動的初期化前にゼロ初期化されるため current==0 が「未初期化」を表す。
+	   入口は malloc ではなく try_alloc に置く: operator new (alloc) / realloc も
+	   同じ遅延初期化を通る。 */
 	mallocator_(){ ensure_init(); }
 	~mallocator_(){}
 
@@ -140,11 +142,12 @@ public:
 		return (MNODE*)0;
 	}
 
+	/* 予約を広げる。失敗時は 0 を返す (送出しない: try_alloc 参照)。 */
 	size_ enlarge(){
-		if ( current_bound == heap_end ) throw std::bad_alloc();
+		if ( current_bound == heap_end ) return 0;
 		unsigned int alloc_size = size + MALLOCATOR_ALLOC_LEAST * PAGE_SZ;
 		uintptr_t addr = (uintptr_t)current_bound + alloc_size;
-		if ( addr < (uintptr_t)heap_begin ) throw std::bad_alloc();
+		if ( addr < (uintptr_t)heap_begin ) return 0;
 		if ( (uintptr_t)heap_end < addr ){
 			size += (unsigned int)(uintptr_t)(heap_end - current_bound);
 			current_bound = heap_end;
@@ -155,14 +158,30 @@ public:
 		return alloc_size;
 	}
 
+	/* operator new 用: 失敗時に std::bad_alloc を送出する (原典と同じ意味論)。 */
 	unsigned char* alloc(size_ _size){
-		if ( _size == 0 ) throw std::bad_alloc();
+		unsigned char* p = try_alloc(_size);
+		if ( p == 0 ) throw std::bad_alloc();
+		return p;
+	}
+
+	/* malloc 用: 失敗時に 0 を返し、送出しない。
+	   C++ 実行時 (libstdc++ の __cxa_allocate_exception や emergency pool) は
+	   malloc を使うため、本 allocator が process の malloc を担う環境 (bare-metal、
+	   ELF のシンボル interpose) で malloc 内から送出すると、例外オブジェクトの確保が
+	   malloc へ再入して OOM -> throw -> malloc ... と無限再帰する。また Linux では
+	   mallocator の動的初期化前に libstdc++ の初期化が malloc を呼ぶ (未初期化状態は
+	   current==current_bound==0)。入口の ensure_init() でその場で初期化して応える
+	   (旧版はここで 0 を返していた。送出しないことは変わらない)。 */
+	unsigned char* try_alloc(size_ _size){
+		if ( _size == 0 ) return 0;
+		ensure_init();   /* 動的初期化前の呼出し (ELF interpose) に備えた遅延初期化 */
 		/* 要求サイズを境界へ切り上げ。以降 _size/require/tmp->size は全て
 		   MALLOCATOR_ALIGN の倍数となり、整列した heap_begin から並べる限り
 		   全ノード・全 user ポインタが整列を保つ (再利用時の分割・併合も倍数
 		   同士の加減算なので整列が崩れない)。 */
 		unsigned int aligned = malloc_align_up(_size);
-		if ( aligned < _size ) throw std::bad_alloc();   /* 丸めのオーバフロー */
+		if ( aligned < _size ) return 0;   /* 丸めのオーバフロー */
 		_size = aligned;
 		unsigned int require = _size + sizeof(MNODE);
 
@@ -187,8 +206,8 @@ public:
 		/* bump パス: frontier を前進させる。予約が足りなければ enlarge で
 		   後方 (heap_end 方向) へ広げる。 */
 		uintptr_t calc = (uintptr_t)current + require;
-		if ( (unsigned char*)calc >= heap_end ) throw std::bad_alloc();
-		while ( calc > (uintptr_t)current_bound ) enlarge();
+		if ( (unsigned char*)calc >= heap_end ) return 0;
+		while ( calc > (uintptr_t)current_bound ) if ( enlarge() == 0 ) return 0;
 		MNODE* tmp = (MNODE*)current;
 		tmp->state = MALLOCATOR::USED + 1;   /* USED + refcnt(1) */
 		tmp->size = _size;
